@@ -88,6 +88,8 @@ def get_vla_dataset(
     data_root_dir = data_cfg.data_root_dir
     data_mix = data_cfg.data_mix
     delete_pause_frame = data_cfg.get("delete_pause_frame", False)
+    # サンプルの抽出は hash(epoch, index, seed) で決まる。追加学習で同じ列を繰り返さないよう、設定から変えられるようにする
+    seed = int(data_cfg.get("seed", seed))
     mixture_spec = DATASET_NAMED_MIXTURES[data_mix]
     logger.info(f"[dataloader] Using mixture '{data_mix}': {[(d, w, r) for d, w, r in mixture_spec]}")
     included_datasets, filtered_mixture_spec = set(), []

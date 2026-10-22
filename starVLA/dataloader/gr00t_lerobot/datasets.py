@@ -2231,6 +2231,8 @@ class LeRobotMixtureDataset(Dataset):
             else False
         )
 
+        self._init_wm_targets()
+
         self._valid_step_bounds: list[tuple[int, int]] = []
         self._effective_trajectory_lengths: list[np.ndarray] = []
         if self.drop_incomplete_action_chunks:
@@ -2383,6 +2385,35 @@ class LeRobotMixtureDataset(Dataset):
         self.epoch = epoch
         # self.sampled_steps = self.sample_epoch()
 
+    def _init_wm_targets(self) -> None:
+        """WM-Align の目標キャッシュを開く。data_cfg.wm_align.enabled が真のときだけ有効。
+
+        sample["wm_target"] に [V, T, 64, 768] float16 を足す (V = 視点数, T = 時刻オフセット数)。
+        data_cfg.wm_align: {enabled, cache_dir, offsets: [4,8,12,16], current_target: false}
+        """
+        self.wm_caches = None
+        cfg = self.data_cfg.get("wm_align", None) if self.data_cfg is not None else None
+        if cfg is None or not cfg.get("enabled", False):
+            return
+        from starVLA.model.modules.align.target_cache import DEFAULT_OFFSETS, TargetCache
+
+        self.wm_offsets = tuple(cfg.get("offsets", DEFAULT_OFFSETS))
+        self.wm_current_target = bool(cfg.get("current_target", False))
+        self.wm_caches = {}
+        for dataset in self.datasets:
+            views = [k.replace("video.", "", 1) for k in dataset.modality_keys["video"]]
+            cache = TargetCache(cfg["cache_dir"], dataset.dataset_name, views)
+            # 学習側のエピソード長とキャッシュの長さが一致することを確かめる (ずれると目標が別フレームになる)
+            for tid, length in zip(dataset.trajectory_ids, dataset.trajectory_lengths):
+                pos = cache.episode_pos[int(tid)]
+                if int(cache.lengths[pos]) != int(length):
+                    raise ValueError(
+                        f"WM キャッシュの長さが不一致: {dataset.dataset_name} ep{tid}: "
+                        f"cache {cache.lengths[pos]} != dataset {length}"
+                    )
+            self.wm_caches[dataset.dataset_name] = cache
+        print(f"[WM-Align] target cache enabled: offsets={self.wm_offsets} current_target={self.wm_current_target}")
+
     def sample_step(self, index: int) -> tuple[LeRobotSingleDataset, int, int]:
         """Sample a single step from the dataset."""
         # return self.sampled_steps[index]
@@ -2456,7 +2487,11 @@ class LeRobotMixtureDataset(Dataset):
                 raw_data = dataset.get_step_data(trajectory_id, step)    
                 data = dataset.transforms(raw_data)
                 sample = dataset._pack_sample(data)
-                
+                if self.wm_caches is not None:
+                    sample["wm_target"] = self.wm_caches[dataset.dataset_name].get_by_episode(
+                        trajectory_id, step, self.wm_offsets, self.wm_current_target
+                    )
+
                 return sample
                 
             except Exception as e:
