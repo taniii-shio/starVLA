@@ -168,6 +168,69 @@ class VLATrainer(TrainerUtils):
         )
 
         self._init_wandb()
+        self._init_grad_log()
+
+    def _init_grad_log(self):
+        """診断用の勾配ノルム記録 (環境変数 GRAD_LOG=true のときだけ有効。学習の計算は変えない)。
+
+        ZeRO-2 では accelerator.backward() の中で DeepSpeed が「クリップ → optimizer 更新 → 勾配ゼロ化」まで済ませる。
+        戻った後に param.grad を読んでも空なので、(1) 全体ノルムは DeepSpeed が保持するクリップ前の値を読み、
+        (2) AlignHead の勾配はパラメータのフックで自前に積算する。1 GPU 前提 (多 GPU ではランクごとの値になる)。
+        """
+        self._grad_log_fh = None
+        if os.environ.get("GRAD_LOG", "").lower() not in {"1", "true", "yes"}:
+            return
+        if self.accelerator.num_processes != 1:
+            logger.warning("GRAD_LOG は 1 GPU 前提。無効にする")
+            return
+        inner = _unwrap_model(self.accelerator, self.model)
+        head = getattr(inner, "align_head", None)
+        self._gl_head_params = list(head.parameters()) if head is not None else []
+        self._gl_head_buf = {}  # param -> 積算した勾配 (float32)。勾配累積の 4 回ぶんを足す = DeepSpeed が見る勾配と同じ
+        for p in self._gl_head_params:
+            p.register_hook(self._make_head_hook(p))
+        self._gl_actions = []
+        self._gl_worlds = []
+        self._grad_log_fh = open(Path(self.config.output_dir) / "grad_log.jsonl", "a")
+        logger.info(f"GRAD_LOG 有効: head params={len(self._gl_head_params)} -> {self._grad_log_fh.name}")
+
+    def _make_head_hook(self, p):
+        def hook(grad):
+            g = grad.detach().float()
+            buf = self._gl_head_buf.get(p)
+            self._gl_head_buf[p] = g.clone() if buf is None else buf.add_(g)
+
+        return hook
+
+    def _record_grad_log(self, action_loss, world_loss):
+        """勾配累積の最後のマイクロバッチ (= DeepSpeed が更新した step) の直後に 1 行書く。"""
+        self._gl_actions.append(action_loss)
+        if world_loss is not None:
+            self._gl_worlds.append(world_loss)
+        if not self.accelerator.sync_gradients:
+            return
+        engine = self.accelerator.deepspeed_engine_wrapped.engine
+        total = engine.get_global_grad_norm()  # クリップ前の全体ノルム (DeepSpeed 内部の値)
+        total = float(total) if total is not None else float("nan")
+        head_sq = sum(float(b.pow(2).sum()) for b in self._gl_head_buf.values())
+        head = head_sq**0.5
+        max_norm = float(self.config.trainer.gradient_clipping or 0.0)
+        coef = 1.0 / max(1.0, (total + 1e-6) / max_norm) if max_norm > 0 else 1.0
+        rest = max(total**2 - head_sq, 0.0) ** 0.5
+        row = {
+            "step": self.completed_steps + 1,
+            "total_norm": total,
+            "head_norm": head,
+            "rest_norm": rest,
+            "clip_coef": coef,
+            "action_loss": sum(self._gl_actions) / len(self._gl_actions),
+        }
+        if self._gl_worlds:
+            row["world_loss"] = sum(self._gl_worlds) / len(self._gl_worlds)
+        self._grad_log_fh.write(json.dumps(row) + "\n")
+        self._grad_log_fh.flush()
+        self._gl_head_buf.clear()
+        self._gl_actions, self._gl_worlds = [], []
 
     def _calculate_total_batch_size(self):
         """Calculate global batch size."""
@@ -441,6 +504,8 @@ class VLATrainer(TrainerUtils):
         metrics = {"action_dit_loss": action_loss.item()}
         if aux_loss is not None:
             metrics["world_loss"] = output_dict["world_loss"].item()
+        if getattr(self, "_grad_log_fh", None) is not None:
+            self._record_grad_log(metrics["action_dit_loss"], metrics.get("world_loss"))
         return metrics
 
     def _finalize_training(self):

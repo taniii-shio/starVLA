@@ -32,6 +32,8 @@ class Qwen_PI_Align(Qwen_PI):
         self.align_layer = int(align_cfg.get("layer", 18))  # 1 始まり。vl_embs_list[layer-1] がその層の出力
         self.align_n_views = int(align_cfg.get("n_views", 2))
         self.align_n_patch = int(align_cfg.get("n_patch", 64))
+        # 診断用 (既定 false = 論文どおり)。true なら補助損失の勾配を VLM に流さず、ヘッドだけを学習する
+        self.align_detach_input = bool(align_cfg.get("detach_input", False))
         n_t = int(align_cfg.get("n_t", 4))
         d_feat = int(align_cfg.get("d_feat", 768))
         d_hidden = int(align_cfg.get("d_hidden", 4096))
@@ -78,6 +80,8 @@ class Qwen_PI_Align(Qwen_PI):
         input_ids = self._last_input_ids
         self._align_hidden = None
         self._last_input_ids = None
+        if self.align_detach_input:
+            hidden = hidden.detach()  # DiT への cross-attention 入力 (vl_embs_list) には影響しない
 
         tokens = gather_visual_tokens(hidden, input_ids, self.image_token_id, self.align_n_views, self.align_n_patch)
         pred = self.align_head(tokens)  # [B,V,P,T,C]
